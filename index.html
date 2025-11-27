@@ -260,16 +260,15 @@
 
   <script>
     const MS_PER_DAY = 1000 * 60 * 60 * 24;
-    const GOLD_MARKET_CAP = 14_200_000_000_000; // static est.
 
     // VAULT DATA WITH REDEEM SCRIPTS.
-    // btcAmount will be overwritten by live on-chain balance.
+    // investedUsd is a fallback; will be overwritten by on-chain cost basis if we can compute it.
     const vaults = [
       {
         label: "3/12/22 Timelock",
         address: "3KMrnQymf9gfu1QzYTepCGy8rv4Je2nHby",
-        investedUsd: 500.0,
-        btcAmount: 0.0, // will be updated from chain
+        investedUsd: 500.0,     // fallback
+        btcAmount: 0.0,         // will hydrate from chain
         startDate: "2022-03-12",
         redeemScript:
           "048084d363b1752102a409dbeee83b74abf917bfb784b6922777ce9c5d00945c324c65e3a23e5c59f1ac",
@@ -361,8 +360,8 @@
         vault.investedUsd > 0 ? (pl / vault.investedUsd) * 100 : 0;
       const blendedAverage =
         vault.btcAmount > 0 ? vault.investedUsd / vault.btcAmount : 0;
-      const sats = Math.round(vault.btcAmount * 100_000_000);
 
+      const sats = Math.round(vault.btcAmount * 100_000_000);
       let daysInMarket = 0;
       if (vault.startDate) {
         const start = new Date(vault.startDate);
@@ -425,7 +424,9 @@
       }
     }
 
-    // FETCH LIVE ON-CHAIN BALANCES FOR EACH ADDRESS (using Blockstream API)
+    // ========== ON-CHAIN DATA LAYER ==========
+
+    // 1) Live balance (sats) from Blockstream
     async function fetchAddressBalanceSats(address) {
       try {
         const res = await fetch(`https://blockstream.info/api/address/${address}`);
@@ -444,14 +445,98 @@
       }
     }
 
-    async function hydrateVaultBalances() {
-      for (const vault of vaults) {
-        const sats = await fetchAddressBalanceSats(vault.address);
-        vault.btcAmount = sats / 100_000_000;
+    // 2) Transaction history for cost basis
+    async function fetchAddressTxs(address) {
+      try {
+        const res = await fetch(`https://blockstream.info/api/address/${address}/txs`);
+        if (!res.ok) throw new Error("HTTP " + res.status);
+        const data = await res.json();
+        return data || [];
+      } catch (e) {
+        console.error("Error fetching txs for", address, e);
+        return [];
       }
     }
 
-    // RENDER VAULT CARDS
+    // 3) BTC price cache by day to limit Coingecko calls
+    const priceCache = new Map(); // dayKey -> price in USD
+
+    async function getBtcPriceAtTime(unixSec) {
+      const dayKey = Math.floor(unixSec / 86400); // whole day bucket
+      if (priceCache.has(dayKey)) {
+        return priceCache.get(dayKey);
+      }
+
+      const from = dayKey * 86400;
+      const to = from + 86400;
+
+      try {
+        const url = `https://api.coingecko.com/api/v3/coins/bitcoin/market_chart/range?vs_currency=usd&from=${from}&to=${to}`;
+        const res = await fetch(url);
+        if (!res.ok) throw new Error("HTTP " + res.status);
+        const data = await res.json();
+        const prices = data.prices || [];
+
+        if (!prices.length) {
+          return null;
+        }
+
+        // simple average price for the day
+        const avg =
+          prices.reduce((sum, [ts, p]) => sum + p, 0) / prices.length;
+
+        priceCache.set(dayKey, avg);
+        return avg;
+      } catch (e) {
+        console.error("Error fetching historical price:", e);
+        return null;
+      }
+    }
+
+    // 4) Compute investedUsd from all incoming txs
+    async function hydrateVaultInvestedUsd(vault) {
+      const txs = await fetchAddressTxs(vault.address);
+      let totalUsd = 0;
+      let counted = 0;
+
+      for (const tx of txs) {
+        const time = tx.status && tx.status.block_time
+          ? tx.status.block_time
+          : Math.floor(Date.now() / 1000);
+
+        // sats coming IN to this address in this tx
+        let satsIn = 0;
+        for (const vout of tx.vout || []) {
+          if (vout.scriptpubkey_address === vault.address) {
+            satsIn += vout.value || 0;
+          }
+        }
+        if (!satsIn) continue;
+
+        const price = await getBtcPriceAtTime(time);
+        if (!price) continue;
+
+        totalUsd += (satsIn / 1e8) * price;
+        counted++;
+      }
+
+      // Only overwrite manual investedUsd if we actually computed something
+      if (counted > 0) {
+        vault.investedUsd = totalUsd;
+      }
+    }
+
+    // 5) Hydrate BTC amount and investedUsd for all vaults
+    async function hydrateVaultsFromChain() {
+      for (const vault of vaults) {
+        const sats = await fetchAddressBalanceSats(vault.address);
+        vault.btcAmount = sats / 100_000_000;
+        await hydrateVaultInvestedUsd(vault);
+      }
+    }
+
+    // ========== RENDER LAYER ==========
+
     function renderVaults(btcPrice) {
       const container = document.getElementById("vault-list");
       container.innerHTML = "";
@@ -575,7 +660,8 @@
       });
     }
 
-    // TOP METRICS + BALANCES + RENDER
+    // ========== TOP METRICS + BOOTSTRAP ==========
+
     async function loadBitcoinData() {
       try {
         const res = await fetch(
@@ -593,7 +679,7 @@
         if (mcapEl) mcapEl.textContent = `$${mcap.toLocaleString()}`;
         if (goldEl) goldEl.textContent = "$14.2T (static est.)";
 
-        await hydrateVaultBalances(); // pull real BTC balances
+        await hydrateVaultsFromChain();   // pulls BTC + investedUsd
         renderVaults(price);
       } catch (err) {
         console.error("Error loading BTC data:", err);
