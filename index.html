@@ -262,6 +262,576 @@
     const MS_PER_DAY = 1000 * 60 * 60 * 24;
     const GOLD_MARKET_CAP = 14_200_000_000_000; // static est.
 
+    // VAULT DATA WITH REDEEM SCRIPTS.
+    // btcAmount will be overwritten by live on-chain balance.
+    const vaults = [
+      {
+        label: "3/12/22 Timelock",
+        address: "3KMrnQymf9gfu1QzYTepCGy8rv4Je2nHby",
+        investedUsd: 500.0,
+        btcAmount: 0.0, // will be updated from chain
+        startDate: "2022-03-12",
+        redeemScript:
+          "048084d363b1752102a409dbeee83b74abf917bfb784b6922777ce9c5d00945c324c65e3a23e5c59f1ac",
+        notes: "🎯 First base vault started March 12, 2022."
+      },
+      {
+        label: "2026-01-01 – Timelock Vault",
+        address: "3ECBoJHeYwz4qDdovgHhME3Une89Zw63Ah",
+        investedUsd: 0.0,
+        btcAmount: 0.0,
+        startDate: "2025-12-31",
+        redeemScript:
+          "0440d25669b1752103419f9f7aaa0131bc1a0887f4ab90516ddefc667108c620f2267e87cc415395a9ac",
+        notes: "🔐 Placeholder for Jan 1, 2026 timelock."
+      },
+      {
+        label: "2026-04-01 – Timelock Vault",
+        address: "346AQ1Gz8AP9rmzupgj36vsuecjyNdtqt4",
+        investedUsd: 0.0,
+        btcAmount: 0.0,
+        startDate: "2026-03-31",
+        redeemScript:
+          "04306bcd69b17521039aa675465c3665e3612114a173a58f0521bb0ae1b9a682fea481432776",
+        notes: "🔐 Placeholder for Apr 1, 2026 timelock."
+      }
+    ];
+
+    // NOTES (localStorage)
+    function saveVaultNotes(address, text) {
+      localStorage.setItem(`vault-notes-${address}`, text);
+    }
+
+    function getStoredNotes(address) {
+      return localStorage.getItem(`vault-notes-${address}`) || "";
+    }
+
+    // FORMATTING HELPERS
+    function formatUsd(num) {
+      return `$${num.toLocaleString(undefined, {
+        minimumFractionDigits: 2,
+        maximumFractionDigits: 2
+      })}`;
+    }
+
+    function formatNumber(num) {
+      return num.toLocaleString();
+    }
+
+    // Decode CLTV from redeem script (absolute timelock)
+    function parseCltvFromRedeemScript(hex) {
+      if (!hex) return null;
+
+      const bytes = Uint8Array.from(
+        (hex.match(/.{1,2}/g) || []).map(b => parseInt(b, 16))
+      );
+
+      const pushLen = bytes[0];
+      if (pushLen < 3 || pushLen > 5) return null;
+
+      let value = 0;
+      for (let i = 0; i < pushLen; i++) {
+        value |= bytes[1 + i] << (8 * i);
+      }
+
+      // CLTV rule: >= 500,000,000 → Unix timestamp (seconds)
+      if (value >= 500_000_000) {
+        return new Date(value * 1000).toISOString();
+      }
+
+      // Block-height timelocks not converted here
+      return null;
+    }
+
+    function getUnlockDateIso(vault) {
+      if (vault.redeemScript) {
+        const iso = parseCltvFromRedeemScript(vault.redeemScript);
+        if (iso) return iso;
+      }
+      if (vault.unlockDate) {
+        return vault.unlockDate;
+      }
+      return null;
+    }
+
+    function computeVaultMetrics(vault, btcPrice) {
+      const currentValue = vault.btcAmount * btcPrice;
+      const pl = currentValue - vault.investedUsd;
+      const roiPct =
+        vault.investedUsd > 0 ? (pl / vault.investedUsd) * 100 : 0;
+      const blendedAverage =
+        vault.btcAmount > 0 ? vault.investedUsd / vault.btcAmount : 0;
+      const sats = Math.round(vault.btcAmount * 100_000_000);
+
+      let daysInMarket = 0;
+      if (vault.startDate) {
+        const start = new Date(vault.startDate);
+        const now = new Date();
+        daysInMarket = Math.floor((now - start) / MS_PER_DAY);
+      }
+
+      return {
+        currentValue,
+        pl,
+        roiPct,
+        blendedAverage,
+        sats,
+        daysInMarket
+      };
+    }
+
+    function computeLockStatus(vault) {
+      const unlockIso = getUnlockDateIso(vault);
+      const start = vault.startDate ? new Date(vault.startDate) : null;
+
+      if (!unlockIso || !start) return null;
+
+      const now = new Date();
+      const unlock = new Date(unlockIso);
+
+      const totalMs = Math.max(unlock - start, 0);
+      const elapsedMs = Math.min(Math.max(now - start, 0), totalMs);
+      const remainingMs = Math.max(unlock - now, 0);
+
+      const pct = totalMs > 0 ? (elapsedMs / totalMs) * 100 : 100;
+
+      const abs = Math.abs(unlock - now);
+      const days = Math.floor(abs / MS_PER_DAY);
+      const hours = Math.floor((abs % MS_PER_DAY) / (1000 * 60 * 60));
+
+      if (now >= unlock) {
+        return {
+          status: "Unlocked",
+          className: "status-unlockable",
+          countdownText: `Unlocked ${days}d ${hours}h ago`,
+          barPct: 100,
+          barClass: "progress-late"
+        };
+      } else {
+        let barClass = "progress-early";
+        if (pct >= 66) {
+          barClass = "progress-late";
+        } else if (pct >= 33) {
+          barClass = "progress-mid";
+        }
+
+        return {
+          status: "Locked",
+          className: "status-locked",
+          countdownText: `${days}d ${hours}h left`,
+          barPct: pct,
+          barClass
+        };
+      }
+    }
+
+    // FETCH LIVE ON-CHAIN BALANCES FOR EACH ADDRESS (using Blockstream API)
+    async function fetchAddressBalanceSats(address) {
+      try {
+        const res = await fetch(`https://blockstream.info/api/address/${address}`);
+        if (!res.ok) throw new Error("HTTP " + res.status);
+        const data = await res.json();
+        const chain = data.chain_stats;
+        const mempool = data.mempool_stats;
+        const funded =
+          (chain.funded_txo_sum || 0) + (mempool.funded_txo_sum || 0);
+        const spent =
+          (chain.spent_txo_sum || 0) + (mempool.spent_txo_sum || 0);
+        return funded - spent; // sats
+      } catch (e) {
+        console.error("Error fetching balance for", address, e);
+        return 0;
+      }
+    }
+
+    async function hydrateVaultBalances() {
+      for (const vault of vaults) {
+        const sats = await fetchAddressBalanceSats(vault.address);
+        vault.btcAmount = sats / 100_000_000;
+      }
+    }
+
+    // RENDER VAULT CARDS
+    function renderVaults(btcPrice) {
+      const container = document.getElementById("vault-list");
+      container.innerHTML = "";
+
+      vaults.forEach((vault) => {
+        const m = computeVaultMetrics(vault, btcPrice);
+
+        const start = vault.startDate ? new Date(vault.startDate) : null;
+        const unlockIso = getUnlockDateIso(vault);
+        const unlock = unlockIso ? new Date(unlockIso) : null;
+
+        const startLabel = start
+          ? start.toLocaleDateString(undefined, {
+              year: "numeric",
+              month: "short",
+              day: "numeric"
+            })
+          : "N/A";
+
+        const unlockLabel = unlock
+          ? unlock.toLocaleDateString(undefined, {
+              year: "numeric",
+              month: "short",
+              day: "numeric"
+            })
+          : "N/A";
+
+        const lockInfo = computeLockStatus(vault);
+
+        let lockRowHtml = "";
+        if (start && unlock && lockInfo) {
+          lockRowHtml = `
+            <div class="lock-row">
+              🔐 ${startLabel} → ${unlockLabel}
+              <span class="lock-count">(⏳ ${lockInfo.countdownText})</span>
+              <span class="lock-status ${lockInfo.className}">${lockInfo.status}</span>
+            </div>
+            <div class="timelock-progress">
+              <div class="timelock-progress-fill ${lockInfo.barClass}" style="width: ${lockInfo.barPct.toFixed(
+                1
+              )}%;"></div>
+            </div>
+          `;
+        } else if (start && !unlock) {
+          lockRowHtml = `
+            <div class="lock-row">
+              🔐 ${startLabel}
+            </div>
+          `;
+        }
+
+        const existingNotes =
+          getStoredNotes(vault.address) || vault.notes || "";
+
+        const html = `
+          <div class="vault-card">
+            <div class="vault-header">
+              <div class="vault-title">🧱 ${vault.label}</div>
+              <div class="vault-address">🔑 ${vault.address}</div>
+            </div>
+
+            ${lockRowHtml}
+
+            <div class="vault-dashboard">
+              <div class="metric-row">
+                <span class="metric-label">💸 Total invested</span>
+                <span class="metric-value">${formatUsd(vault.investedUsd)}</span>
+              </div>
+              <div class="metric-row">
+                <span class="metric-label">🪙 BTC accumulated</span>
+                <span class="metric-value">${vault.btcAmount.toFixed(8)} BTC</span>
+              </div>
+              <div class="metric-row">
+                <span class="metric-label">⚡ Sats accumulated</span>
+                <span class="metric-value">${formatNumber(
+                  Math.round(vault.btcAmount * 100_000_000)
+                )} sats</span>
+              </div>
+              <div class="metric-row">
+                <span class="metric-label">🎯 Blended average</span>
+                <span class="metric-value">${
+                  m.blendedAverage ? formatUsd(m.blendedAverage) : "$0.00 / BTC"
+                }</span>
+              </div>
+              <div class="metric-row">
+                <span class="metric-label">📈 Current value</span>
+                <span class="metric-value">${formatUsd(m.currentValue)}</span>
+              </div>
+              <div class="metric-row">
+                <span class="metric-label">💹 P/L & ROI</span>
+                <span class="metric-value ${
+                  m.pl >= 0 ? "pl-positive" : "pl-negative"
+                }">
+                  ${(m.pl >= 0 ? "+" : "") + formatUsd(m.pl)}
+                  (${m.roiPct.toFixed(2)}%)
+                </span>
+              </div>
+              <div class="metric-row">
+                <span class="metric-label">⏳ Time in market</span>
+                <span class="metric-value">${m.daysInMarket} days</span>
+              </div>
+            </div>
+
+            <div class="vault-notes">
+              <div class="vault-notes-title">📝 Notes</div>
+              <textarea placeholder="Add notes for this vault…">${existingNotes}</textarea>
+            </div>
+          </div>
+        `;
+
+        const wrapper = document.createElement("div");
+        wrapper.innerHTML = html.trim();
+        const cardEl = wrapper.firstElementChild;
+
+        const textarea = cardEl.querySelector("textarea");
+        textarea.addEventListener("input", (e) => {
+          saveVaultNotes(vault.address, e.target.value);
+        });
+
+        container.appendChild(cardEl);
+      });
+    }
+
+    // TOP METRICS + BALANCES + RENDER
+    async function loadBitcoinData() {
+      try {
+        const res = await fetch(
+          "https://api.coingecko.com/api/v3/simple/price?ids=bitcoin&vs_currencies=usd&include_market_cap=true"
+        );
+        const data = await res.json();
+        const price = data.bitcoin.usd;
+        const mcap = data.bitcoin.usd_market_cap;
+
+        const priceEl = document.getElementById("btc-price");
+        const mcapEl = document.getElementById("btc-mcap");
+        const goldEl = document.getElementById("gold-mcap");
+
+        if (priceEl) priceEl.textContent = `$${price.toLocaleString()}`;
+        if (mcapEl) mcapEl.textContent = `$${mcap.toLocaleString()}`;
+        if (goldEl) goldEl.textContent = "$14.2T (static est.)";
+
+        await hydrateVaultBalances(); // pull real BTC balances
+        renderVaults(price);
+      } catch (err) {
+        console.error("Error loading BTC data:", err);
+      }
+    }
+
+    loadBitcoinData();
+    setInterval(loadBitcoinData, 60_000);
+  </script>
+</body>
+</html>      font-size: 1.6rem;
+    }
+
+    .title-block p {
+      margin: 0.25rem 0 0;
+      opacity: 0.8;
+      font-size: 0.9rem;
+    }
+
+    .market-strip {
+      display: flex;
+      flex-wrap: wrap;
+      gap: 0.75rem;
+      margin-top: 0.9rem;
+    }
+
+    .strip-item {
+      flex: 1 1 220px;
+      padding: 0.7rem 0.9rem;
+      border-radius: 16px;
+      background: rgba(10, 12, 26, 0.98);
+      box-shadow: 0 10px 26px rgba(0, 0, 0, 0.45);
+    }
+
+    .strip-item .label {
+      font-size: 0.8rem;
+      opacity: 0.75;
+      margin-bottom: 0.2rem;
+    }
+
+    .strip-item .value {
+      font-size: 1.05rem;
+      font-weight: 600;
+    }
+
+    .card {
+      border-radius: 18px;
+      background: rgba(8, 10, 22, 0.98);
+      box-shadow: 0 14px 34px rgba(0, 0, 0, 0.6);
+      padding: 1rem 1.25rem 1.25rem;
+      margin-bottom: 1.25rem;
+    }
+
+    .vault-section h2 {
+      margin: 0 0 0.5rem;
+      font-size: 1.2rem;
+      display: flex;
+      align-items: center;
+      gap: 0.4rem;
+    }
+
+    .vault-card {
+      margin-top: 0.9rem;
+      padding: 0.9rem 1rem 1.1rem;
+      border-radius: 16px;
+      background: rgba(6, 8, 18, 0.98);
+      box-shadow: 0 10px 28px rgba(0, 0, 0, 0.6);
+    }
+
+    .vault-header {
+      margin-bottom: 0.35rem;
+    }
+
+    .vault-title {
+      font-weight: 600;
+      font-size: 1rem;
+    }
+
+    .vault-address {
+      font-size: 0.78rem;
+      opacity: 0.8;
+      word-break: break-all;
+    }
+
+    .lock-row {
+      font-size: 0.82rem;
+      margin: 0.35rem 0 0.4rem;
+      display: flex;
+      flex-wrap: wrap;
+      gap: 0.4rem;
+      align-items: center;
+    }
+
+    .lock-count {
+      opacity: 0.85;
+    }
+
+    .lock-status {
+      display: inline-block;
+      padding: 0.1rem 0.55rem;
+      border-radius: 999px;
+      font-size: 0.7rem;
+      font-weight: 600;
+    }
+
+    .status-locked {
+      background: rgba(255, 107, 107, 0.18);
+      color: #ff6b6b;
+    }
+
+    .status-unlockable {
+      background: rgba(52, 227, 154, 0.18);
+      color: #34e39a;
+    }
+
+    /* Timelock progress bar */
+    .timelock-progress {
+      width: 100%;
+      height: 6px;
+      border-radius: 999px;
+      background: rgba(255, 255, 255, 0.06);
+      overflow: hidden;
+      margin-bottom: 0.55rem;
+    }
+
+    .timelock-progress-fill {
+      height: 100%;
+      width: 0%;
+      border-radius: inherit;
+      transition: width 0.4s ease;
+    }
+
+    .progress-early {
+      background: #ff4d4f;   /* far from unlock – red */
+    }
+
+    .progress-mid {
+      background: #ffc107;   /* mid-way – yellow */
+    }
+
+    .progress-late {
+      background: #4caf50;   /* close to or past unlock – green */
+    }
+
+    .metric-row {
+      display: flex;
+      justify-content: space-between;
+      align-items: center;
+      font-size: 0.9rem;
+      margin: 0.25rem 0;
+      gap: 0.75rem;
+    }
+
+    .metric-label {
+      opacity: 0.8;
+    }
+
+    .metric-value {
+      font-weight: 600;
+      text-align: right;
+      white-space: nowrap;
+    }
+
+    .pl-positive {
+      color: #34e39a;
+    }
+
+    .pl-negative {
+      color: #ff6b6b;
+    }
+
+    .vault-notes {
+      margin-top: 0.9rem;
+      padding: 0.75rem;
+      background: rgba(255, 255, 255, 0.04);
+      border-radius: 12px;
+      font-size: 0.86rem;
+    }
+
+    .vault-notes-title {
+      margin: 0 0 0.4rem;
+      font-weight: 600;
+    }
+
+    .vault-notes textarea {
+      width: 100%;
+      min-height: 60px;
+      background: rgba(0, 0, 0, 0.4);
+      border: 1px solid rgba(255, 255, 255, 0.18);
+      border-radius: 10px;
+      padding: 0.5rem;
+      color: #fff;
+      resize: vertical;
+      font-size: 0.85rem;
+      font-family: inherit;
+    }
+
+    @media (max-width: 640px) {
+      .dashboard {
+        padding: 1rem 0.75rem 2.5rem;
+      }
+    }
+  </style>
+</head>
+<body>
+  <main class="dashboard">
+    <header class="top-header">
+      <div class="title-block">
+        <h1>⏱️ Bitcoin Timelock Vaults</h1>
+        <p>On-chain DCA & Timelock Monitor</p>
+      </div>
+
+      <div class="market-strip">
+        <div class="strip-item">
+          <div class="label">₿ Bitcoin Price</div>
+          <div class="value" id="btc-price">$0.00</div>
+        </div>
+        <div class="strip-item">
+          <div class="label">📊 Bitcoin Market Cap</div>
+          <div class="value" id="btc-mcap">$0.00</div>
+        </div>
+        <div class="strip-item">
+          <div class="label">🥇 Gold Market Cap</div>
+          <div class="value" id="gold-mcap">$14.2T (static est.)</div>
+        </div>
+      </div>
+    </header>
+
+    <section class="card vault-section">
+      <h2>🧱 Vault Breakdown</h2>
+      <div id="vault-list"></div>
+    </section>
+  </main>
+
+  <script>
+    const MS_PER_DAY = 1000 * 60 * 60 * 24;
+    const GOLD_MARKET_CAP = 14_200_000_000_000; // static est.
+
     // VAULT DATA WITH REDEEM SCRIPTS
     const vaults = [
       {
